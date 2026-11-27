@@ -66,6 +66,7 @@ struct Recording {
 struct AppState {
     windows: Mutex<Vec<WinInfo>>,
     hotkey: Mutex<Option<String>>,
+    mode_floor: Mutex<usize>, // 이 순서부터 녹화 방식을 시도 (MODES 인덱스)
     rec: Mutex<Option<Recording>>,
 }
 
@@ -209,6 +210,25 @@ mod win {
             let _ = AssignProcessToJobObject(job, HANDLE(child.as_raw_handle()));
             // job 핸들은 일부러 닫지 않음: 앱 프로세스가 끝날 때 닫히면서 ffmpeg도 종료됨
         }
+    }
+
+    /// 기본 GPU(어댑터 0)에 연결된 모니터들의 좌표. 순서 = ddagrab의 output_idx
+    pub fn dxgi_outputs() -> Vec<Rect> {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+        let mut out = Vec::new();
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return out };
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return out };
+            let mut i = 0;
+            while let Ok(o) = adapter.EnumOutputs(i) {
+                if let Ok(d) = o.GetDesc() {
+                    let r = d.DesktopCoordinates;
+                    out.push(Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top });
+                }
+                i += 1;
+            }
+        }
+        out
     }
 
     /// 화면 캡처(녹화)에서 이 창을 제외 (Windows 10 2004+)
@@ -418,13 +438,78 @@ struct StartOpts {
     out_dir: String,
 }
 
+/// 녹화 방식 (앞에서부터 시도하고, 바로 실패하면 다음 방식으로)
+/// - DdaQsv : GPU 캡처(ddagrab) + Intel Quick Sync 인코딩. 프레임이 GPU를 벗어나지 않아 CPU 부하가 가장 적음
+/// - DdaX264: GPU 캡처 + CPU 인코딩(libx264)
+/// - Gdi    : gdigrab + libx264. 범위가 여러 모니터에 걸치거나 GPU 캡처를 쓸 수 없을 때
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    DdaQsv,
+    DdaX264,
+    Gdi,
+}
+const MODES: [Mode; 3] = [Mode::DdaQsv, Mode::DdaX264, Mode::Gdi];
+
+fn ffmpeg_args(o: &StartOpts, mode: Mode) -> Option<Vec<String>> {
+    let r = o.rect;
+    let (fps, mouse) = (o.fps, if o.cursor { "1" } else { "0" });
+    let mut a: Vec<String> = Vec::new();
+    let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+
+    if mode == Mode::Gdi {
+        push(&["-f", "gdigrab", "-framerate", &fps.to_string(), "-draw_mouse", mouse]);
+        push(&["-offset_x", &r.x.to_string(), "-offset_y", &r.y.to_string()]);
+        push(&["-video_size", &format!("{}x{}", r.w, r.h), "-i", "desktop"]);
+    } else {
+        // 범위를 완전히 포함하는 모니터(기본 GPU에 연결된 것)만 ddagrab으로 녹화 가능
+        let (idx, out) = win::dxgi_outputs().into_iter().enumerate().find(|(_, m)| {
+            r.x >= m.x && r.y >= m.y && r.x + r.w <= m.x + m.w && r.y + r.h <= m.y + m.h
+        })?;
+        let tail = if mode == Mode::DdaQsv {
+            // setparams: 프레임에 BT.709 · limited 정보를 붙이면 QSV가 그 기준으로 RGB→YUV 변환하고 파일에도 같게 표기됨
+            "hwmap=derive_device=qsv,format=qsv,setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709"
+        } else {
+            "hwdownload,format=bgra"
+        };
+        let graph = format!(
+            "ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={mouse}:offset_x={}:offset_y={}:video_size={}x{},{tail}",
+            r.x - out.x, r.y - out.y, r.w, r.h
+        );
+        push(&["-filter_complex", &graph]);
+    }
+
+    if mode == Mode::DdaQsv {
+        // 영상 스트림 안의 색 정보(VUI)도 BT.709 · limited 로 맞춤 (틀리면 플레이어에서 색이 바래 보임)
+        push(&["-c:v", "h264_qsv", "-preset", "veryfast"]);
+        push(&["-global_quality", &(o.crf + 1).to_string()]);
+        push(&["-bsf:v", "h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1"]);
+    } else {
+        push(&["-c:v", "libx264", "-preset", "superfast", "-crf", &o.crf.to_string(), "-pix_fmt", "yuv420p"]);
+    }
+    Some(a)
+}
+
+fn spawn_ffmpeg(args: &[String], mkv: &PathBuf, log: &PathBuf) -> Result<Child, String> {
+    let log_file = File::create(log).map_err(|e| e.to_string())?;
+    let child = Command::new(ffmpeg_path()?)
+        .args(["-hide_banner", "-loglevel", "warning", "-y"])
+        .args(args)
+        .arg(mkv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(log_file)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("ffmpeg 실행 실패: {e}"))?;
+    win::kill_with_parent(&child);
+    Ok(child)
+}
+
 #[tauri::command]
-fn start_recording(state: State<AppState>, opts: StartOpts) -> Result<String, String> {
-    let mut rec = state.rec.lock().unwrap();
-    if rec.is_some() {
+async fn start_recording(app: AppHandle, opts: StartOpts) -> Result<String, String> {
+    if app.state::<AppState>().rec.lock().unwrap().is_some() {
         return Err("이미 녹화 중입니다.".into());
     }
-    let ff = ffmpeg_path()?;
     let dir = PathBuf::from(&opts.out_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("저장 폴더를 만들 수 없습니다: {e}"))?;
 
@@ -432,28 +517,44 @@ fn start_recording(state: State<AppState>, opts: StartOpts) -> Result<String, St
     // 비정상 종료돼도 살아남도록 MKV로 녹화 → 정지 시 MP4로 변환
     let mkv = dir.join(format!("{name}.mkv"));
     let log = dir.join(format!("{name}.log"));
-    let log_file = File::create(&log).map_err(|e| e.to_string())?;
-    let r = opts.rect;
+    // 이전에 실패한 방식은 이번 실행 동안 건너뜀
+    let first = *app.state::<AppState>().mode_floor.lock().unwrap();
 
-    let child = Command::new(ff)
-        .args(["-hide_banner", "-loglevel", "warning", "-y", "-f", "gdigrab"])
-        .args(["-framerate", &opts.fps.to_string()])
-        .args(["-draw_mouse", if opts.cursor { "1" } else { "0" }])
-        .args(["-offset_x", &r.x.to_string(), "-offset_y", &r.y.to_string()])
-        .args(["-video_size", &format!("{}x{}", r.w, r.h), "-i", "desktop"])
-        .args(["-c:v", "libx264", "-preset", "superfast", "-crf", &opts.crf.to_string()])
-        .args(["-pix_fmt", "yuv420p"])
-        .arg(&mkv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(log_file)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("ffmpeg 실행 실패: {e}"))?;
+    let (child, mode, mkv, log) = tauri::async_runtime::spawn_blocking(move || {
+        let mut last_err = String::from("녹화를 시작할 수 없습니다.");
+        for (i, &mode) in MODES.iter().enumerate().skip(first) {
+            let Some(args) = ffmpeg_args(&opts, mode) else { continue };
+            let mut child = match spawn_ffmpeg(&args, &mkv, &log) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            };
+            if mode == Mode::Gdi {
+                return Ok((child, i, mkv, log)); // 마지막 수단
+            }
+            // 지원하지 않는 방식이면 ffmpeg가 곧바로 종료됨
+            std::thread::sleep(Duration::from_millis(1200));
+            match child.try_wait() {
+                Ok(None) => return Ok((child, i, mkv, log)),
+                _ => last_err = log_tail(&log),
+            }
+        }
+        Err(last_err)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
-    win::kill_with_parent(&child);
-    *rec = Some(Recording { child, mkv: mkv.clone(), log });
-    Ok(mkv.to_string_lossy().into_owned())
+    let state = app.state::<AppState>();
+    // 범위 때문에 건너뛴 게 아니라 실제로 실패한 방식만 다음부터 제외
+    let mut floor = state.mode_floor.lock().unwrap();
+    if MODES[mode] != Mode::Gdi {
+        *floor = mode;
+    }
+    let path = mkv.to_string_lossy().into_owned();
+    *state.rec.lock().unwrap() = Some(Recording { child, mkv, log });
+    Ok(path)
 }
 
 #[derive(Serialize)]

@@ -10,7 +10,7 @@
       border: 2px solid #4c8dff;
       transition: border-color 0.25s;
     }
-    body.rec #b { border-color: #ff453a; animation: pulse 1.6s ease-in-out infinite; }
+    body.rec #b { border-color: #ff453a; } /* 녹화 중엔 애니메이션 없이 (불필요한 화면 갱신 방지) */
     body.flash #b { animation: flash 0.32s ease-in-out 3; }
     @keyframes flash { 50% { border-color: transparent; } }
     @keyframes pulse { 50% { border-color: rgba(255, 69, 58, 0.45); } }
