@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>영역 선택</title>
+  <style>
+    @font-face {
+      font-family: "Pretendard";
+      src: url("fonts/PretendardVariable.woff2") format("woff2-variations");
+      font-weight: 45 920;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      background: transparent; cursor: crosshair; user-select: none;
+      font-family: "Pretendard", "Malgun Gothic", sans-serif;
+    }
+    canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+
+    /* 크기 라벨: transform으로만 이동 → 레이아웃 재계산 없음 */
+    .tag {
+      position: fixed; left: 0; top: 0;
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-radius: 8px;
+      background: #4c8dff; color: #fff;
+      font-size: 12px; font-weight: 600; white-space: nowrap;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+      will-change: transform; visibility: hidden; pointer-events: none;
+    }
+    .tag.show { visibility: visible; }
+    .tag .dims { font-variant-numeric: tabular-nums; }
+    .tag .title { font-weight: 500; opacity: 0.85; max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+    .tag .title:empty { display: none; }
+
+    .hint {
+      position: fixed; top: 28px; left: 50%; transform: translateX(-50%);
+      display: flex; align-items: center; gap: 18px;
+      padding: 11px 18px; border-radius: 12px;
+      background: rgba(22, 23, 26, 0.92); border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #ededf0; font-size: 13px; font-weight: 500;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      pointer-events: none;
+    }
+    .hint span { display: flex; align-items: center; gap: 7px; color: #a3a4ad; }
+    .hint b { font-weight: 600; font-size: 11px; color: #ededf0; padding: 3px 7px; border-radius: 5px; background: #26272c; }
+    .hint .mon { color: #ededf0; font-weight: 600; padding-right: 16px; border-right: 1px solid rgba(255, 255, 255, 0.1); }
+  </style>
+</head>
+<body>
+  <canvas id="cv"></canvas>
+  <div class="tag" id="tag"><span class="dims" id="dims"></span><span class="title" id="title"></span></div>
+  <div class="hint">
+    <span class="mon" id="mon-name"></span>
+    <span><b>클릭</b> 창 선택</span>
+    <span><b>바탕화면 클릭</b> 모니터 전체</span>
+    <span><b>드래그</b> 영역 지정</span>
+    <span><b>ESC</b> 취소</span>
+  </div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+    const { listen, emit } = window.__TAURI__.event;
+    const me = window.__TAURI__.window.getCurrentWindow().label;
+
+    const q = new URLSearchParams(location.search);
+    const ox = Number(q.get("ox")), oy = Number(q.get("oy")); // 이 모니터의 물리 좌표 원점
+    const cv = document.getElementById("cv");
+    const ctx = cv.getContext("2d");
+    const tag = document.getElementById("tag");
+    const dimsEl = document.getElementById("dims");
+    const titleEl = document.getElementById("title");
+
+    let windows = [], monitors = [];
+    let start = null, dragging = false, done = false;
+    let target = null;   // 목표 선택 { rect, label, kind }
+    let shown = null;    // 화면에 그려진 사각형 (애니메이션용, 물리 좌표)
+    let dirty = true, lastKey = null, lastTagText = "";
+
+    invoke("selector_data").then((d) => {
+      windows = d.windows;
+      monitors = d.monitors;
+      const m = monitors.find((m) => m.rect.x === ox && m.rect.y === oy);
+      document.getElementById("mon-name").textContent = m ? m.name : "";
+    });
+
+    function resize() {
+      const k = devicePixelRatio || 1;
+      cv.width = Math.round(innerWidth * k);
+      cv.height = Math.round(innerHeight * k);
+      dirty = true;
+    }
+    addEventListener("resize", resize);
+    resize();
+
+    const phys = (e) => {
+      const k = devicePixelRatio || 1;
+      return { x: Math.round(ox + e.clientX * k), y: Math.round(oy + e.clientY * k) };
+    };
+    const inside = (p, r) => p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h;
+
+    function pickAt(p) {
+      for (const w of windows) if (inside(p, w.rect)) return { rect: w.rect, label: w.title, kind: "window" };
+      for (const m of monitors) if (inside(p, m.rect)) return { rect: m.rect, label: m.name + " 전체", kind: "monitor" };
+      return null;
+    }
+    const keyOf = (s) => (s ? `${s.rect.x},${s.rect.y},${s.rect.w},${s.rect.h}` : "");
+
+    function setTarget(s, { instant = false, broadcast = true } = {}) {
+      if (!s) { target = null; shown = null; }
+      else {
+        target = s;
+        if (!shown || instant) shown = { ...s.rect };
+      }
+      dirty = true;
+      if (broadcast) emitThrottled();
+    }
+
+    // 다른 모니터 오버레이와 상태 공유 (프레임당 최대 1회)
+    let emitQueued = false;
+    function emitThrottled() {
+      if (emitQueued) return;
+      emitQueued = true;
+      requestAnimationFrame(() => {
+        emitQueued = false;
+        emit("sel-draw", { src: me, s: target, drag: dragging });
+      });
+    }
+    listen("sel-draw", ({ payload }) => {
+      if (payload.src === me || done) return;
+      lastKey = keyOf(payload.s);
+      setTarget(payload.s, { instant: payload.drag, broadcast: false });
+    });
+
+    // ---------------- 렌더 루프
+    function frame() {
+      if (target && shown) {
+        const t = target.rect, f = dragging ? 1 : 0.38; // 호버 전환은 부드럽게, 드래그는 즉시
+        let moving = false;
+        for (const k of ["x", "y", "w", "h"]) {
+          const d = t[k] - shown[k];
+          if (Math.abs(d) < 0.5) shown[k] = t[k];
+          else { shown[k] += d * f; moving = true; }
+        }
+        if (moving) dirty = true;
+      }
+      if (dirty) { draw(); dirty = false; }
+      requestAnimationFrame(frame);
+    }
+
+    function draw() {
+      const W = cv.width, H = cv.height, k = devicePixelRatio || 1;
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = "rgba(8, 9, 12, 0.5)";
+      ctx.fillRect(0, 0, W, H);
+      if (!shown) { tag.classList.remove("show"); return; }
+
+      // 캔버스 픽셀 = 물리 픽셀 (원점만 이동)
+      const x = shown.x - ox, y = shown.y - oy, w = shown.w, h = shown.h;
+      ctx.clearRect(x, y, w, h);
+      ctx.fillStyle = "rgba(255, 255, 255, 0.004)"; // 투명 영역에서도 클릭을 받도록
+      ctx.fillRect(x, y, w, h);
+      const lw = Math.max(2, Math.round(2 * k));
+      ctx.lineWidth = lw;
+      ctx.strokeStyle = "#4c8dff";
+      ctx.strokeRect(x + lw / 2, y + lw / 2, w - lw, h - lw);
+
+      // 라벨
+      const txt = `${target.rect.w} × ${target.rect.h}|${dragging ? "" : target.label}`;
+      if (txt !== lastTagText) {
+        lastTagText = txt;
+        const [d, t] = txt.split("|");
+        dimsEl.textContent = d;
+        titleEl.textContent = t;
+      }
+      let lx = x / k, ly = y / k - 36;
+      if (ly < 8) ly = y / k + 10, lx += 10;           // 위에 공간이 없으면 안쪽으로
+      lx = Math.min(Math.max(lx, 8), innerWidth - tag.offsetWidth - 8);
+      ly = Math.min(Math.max(ly, 8), innerHeight - 40);
+      tag.style.transform = `translate(${lx}px, ${ly}px)`;
+      tag.classList.add("show");
+    }
+    requestAnimationFrame(frame);
+
+    // ---------------- 입력
+    addEventListener("pointermove", (e) => {
+      if (done) return;
+      const p = phys(e);
+      if (start) {
+        if (!dragging && Math.abs(p.x - start.x) + Math.abs(p.y - start.y) < 6) return;
+        dragging = true;
+        setTarget({
+          rect: { x: Math.min(start.x, p.x), y: Math.min(start.y, p.y), w: Math.abs(p.x - start.x), h: Math.abs(p.y - start.y) },
+          label: "직접 지정한 영역", kind: "area",
+        }, { instant: true });
+        return;
+      }
+      const s = pickAt(p);
+      const key = keyOf(s);
+      if (key !== lastKey) { lastKey = key; setTarget(s); }
+    });
+
+    addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      document.body.setPointerCapture(e.pointerId);
+      start = phys(e);
+      dragging = false;
+    });
+
+    addEventListener("pointerup", (e) => {
+      if (e.button !== 0 || !start) return;
+      finish(dragging ? target : pickAt(phys(e)));
+    });
+
+    function finish(s) {
+      if (done) return;
+      done = true;
+      invoke("finish_selection", { rect: s ? s.rect : null, label: s ? s.label : "", kind: s ? s.kind : "" });
+    }
+    addEventListener("keydown", (e) => { if (e.key === "Escape") finish(null); });
+    addEventListener("contextmenu", (e) => { e.preventDefault(); finish(null); });
+  </script>
+</body>
+</html>

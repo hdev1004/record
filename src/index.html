@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ko">
+<script>try{var t=JSON.parse(localStorage.getItem("recorder.settings")||"{}").theme||"system";if(t==="system")t=matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";document.documentElement.dataset.theme=t}catch(e){}</script>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>화면 녹화</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="titlebar" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
+        <span class="brand-mark"></span>
+        <span data-tauri-drag-region>화면 녹화</span>
+      </div>
+      <div class="win-ctl">
+        <button id="btn-theme" class="theme" aria-label="테마"></button>
+        <span class="sep"></span>
+        <button id="btn-min" aria-label="최소화">
+          <svg viewBox="0 0 12 12"><path d="M2.5 6h7" /></svg>
+        </button>
+        <button id="btn-close" class="close" aria-label="닫기">
+          <svg viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" /></svg>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <!-- 녹화 범위 미리보기 -->
+      <section class="stage" id="stage">
+        <div class="stage-filled" id="stage-filled">
+          <div class="rec-badge"><span></span>REC</div>
+          <div class="stage-canvas">
+            <!-- 모니터 배치도 + 선택 범위 -->
+            <div class="map" id="map">
+              <div class="frame" id="frame">
+                <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+              </div>
+            </div>
+          </div>
+          <div class="stage-meta">
+            <span class="src-chip" id="src-kind">창</span>
+            <span class="src-title" id="src-title"></span>
+            <span class="src-dims" id="dims"></span>
+            <span class="src-empty">모니터를 클릭하거나 <b>영역 · 창 선택</b>으로 범위를 정하세요</span>
+          </div>
+        </div>
+      </section>
+
+      <div class="pick-row">
+        <button class="btn" id="btn-pick">
+          <svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3" /><path d="M10 10l6 2.2-2.6 1.1L12.3 16z" /></svg>
+          영역 · 창 선택
+        </button>
+        <button class="btn" id="btn-full">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="1.5" /><path d="M9 20h6M12 16.5V20" /></svg>
+          전체 화면
+          <svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5" /></svg>
+        </button>
+        <div class="menu" id="mon-menu" role="menu"></div>
+      </div>
+
+      <section class="group" id="settings">
+        <div class="row">
+          <span class="row-label">프레임</span>
+          <div class="seg" data-key="fps">
+            <button data-v="24">24</button>
+            <button data-v="30">30</button>
+            <button data-v="60">60</button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">화질</span>
+          <div class="seg" data-key="crf">
+            <button data-v="18">고화질</button>
+            <button data-v="23">보통</button>
+            <button data-v="28">저용량</button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-text">
+            <span class="row-label">녹화 단축키</span>
+            <span class="row-sub" id="hk-sub">다른 프로그램을 쓰는 중에도 동작해요</span>
+          </span>
+          <button class="hk" id="hk-btn" title="클릭한 뒤 원하는 키 조합을 누르세요"></button>
+        </div>
+        <label class="row">
+          <span class="row-label">마우스 커서 표시</span>
+          <input type="checkbox" class="switch" id="opt-cursor" />
+        </label>
+        <label class="row">
+          <span class="row-text">
+            <span class="row-label">이 창은 녹화에서 숨기기</span>
+            <span class="row-sub">범위 안에 있어도 영상에 찍히지 않아요</span>
+          </span>
+          <input type="checkbox" class="switch" id="opt-hide" />
+        </label>
+        <div class="row save-row">
+          <span class="row-label">저장 위치 <span class="cap-chip" id="remain-idle"></span></span>
+          <div class="row-actions">
+            <button class="btn-ghost icon" id="btn-open-dir" title="폴더 열기">
+              <svg viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 0 1 2-2h3.6l2 2h7.4a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>
+              열기
+            </button>
+            <button class="btn-ghost" id="btn-dir">변경</button>
+          </div>
+          <button class="path" id="out-path" title="폴더 열기"></button>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <button class="rec" id="btn-rec">
+        <span class="rec-idle">
+          <span class="rec-dot"></span>
+          <span class="rec-label">녹화 시작</span>
+          <kbd id="rec-kbd">F9</kbd>
+        </span>
+        <span class="rec-live">
+          <span class="live-dot"></span>
+          <span class="timer-wrap">
+            <span class="timer" id="timer">00:00:00</span>
+            <span class="timer-sub" id="remain-live">남은 시간 계산 중…</span>
+          </span>
+          <span class="stop"><i></i>정지</span>
+        </span>
+        <span class="rec-saving">
+          <span class="spinner"></span>
+          저장하는 중…
+        </span>
+      </button>
+    </footer>
+
+    <div class="toast" id="toast">
+      <span class="toast-icon" id="toast-icon"></span>
+      <span class="toast-body">
+        <span class="toast-title" id="toast-title"></span>
+        <span class="toast-sub" id="toast-sub"></span>
+      </span>
+      <button class="toast-act ghost" id="toast-folder">폴더</button>
+      <button class="toast-act" id="toast-act">재생</button>
+    </div>
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>

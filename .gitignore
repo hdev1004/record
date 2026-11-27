@@ -1,0 +1,6 @@
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+
+# ffmpeg 바이너리는 100MB가 넘어 저장소에 넣지 않음 → scripts/get-ffmpeg.ps1 로 받기
+src-tauri/binaries/*.exe
